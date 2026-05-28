@@ -1,0 +1,7 @@
+apks/
+out/
+tools/
+*.apk
+*.keystore
+.venv/
+__pycache__/
