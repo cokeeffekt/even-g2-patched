@@ -19,6 +19,11 @@ FRIDA_DIR="$ROOT/frida"
 SCRIPTS_DIR="$ROOT/scripts"
 WORK="$OUT/work"
 
+# Optional: replace the news feed base URL.
+# Must be EXACTLY 24 chars (same length as the original 'https://api2.evenreal.co').
+# Leave unset / empty to keep the original Even Realities news server.
+NEWS_URL="${NEWS_URL:-}"
+
 mkdir -p "$OUT" "$WORK"
 
 for f in APKEditor.jar uber-apk-signer.jar libfrida-gadget.so; do
@@ -28,10 +33,17 @@ done
 echo "[*] 1/5  Merge split APKs"
 java -jar "$TOOLS/APKEditor.jar" m -i "$APKS" -o "$WORK/merged.apk" >/dev/null
 
-echo "[*] 2/5  Extract libapp.so + apply 4-byte NOP"
+echo "[*] 2/5  Extract libapp.so + apply 4-byte NOP (+ optional news URL swap)"
 mkdir -p "$WORK/lib"
 unzip -o -j "$WORK/merged.apk" "lib/arm64-v8a/libapp.so" -d "$WORK/lib" >/dev/null
 $PYTHON "$SCRIPTS_DIR/patch_libapp.py" --input "$WORK/lib/libapp.so" --output "$WORK/lib/libapp.patched.so"
+if [ -n "$NEWS_URL" ]; then
+    echo "    -> swapping news base URL to: $NEWS_URL"
+    $PYTHON "$SCRIPTS_DIR/patch_news_url.py" \
+        --input  "$WORK/lib/libapp.patched.so" \
+        --output "$WORK/lib/libapp.patched.so" \
+        --url    "$NEWS_URL"
+fi
 
 echo "[*] 3/5  Rebuild APK with patched libapp.so + bundled gadget + script + config"
 $PYTHON "$SCRIPTS_DIR/inject_gadget.py" \

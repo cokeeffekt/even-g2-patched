@@ -25,4 +25,15 @@ print(f'    bytes at 0x1be14bc: {got}  (want {want} = nop)')
 print('    OK' if got == want else '    MISMATCH')
 "
 fi
+echo
+echo "  news base URL (post-lief shift, +0x1000 -> 0x1ccf47):"
+python3 -c "
+d = open('$TMP','rb').read()
+url = d[0x1ccf47:0x1ccf47+24].decode('ascii', 'replace')
+print(f'    {url!r}')
+if url == 'https://api2.evenreal.co':
+    print('    unchanged (original Even Realities feed)')
+else:
+    print('    swapped (custom feed)')
+"
 rm -f "$TMP"

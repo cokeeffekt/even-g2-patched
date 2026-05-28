@@ -50,6 +50,9 @@ python -m venv .venv && .venv/bin/pip install lief
                                   # re-signs with uber-apk-signer
                                   # outputs ./out/patched-final.apk
 
+# Optional: also redirect the news feed to your own server (see "News feed redirect" below)
+NEWS_URL='https://news.example.com' ./scripts/build_patched.sh
+
 # 4. Install
 adb uninstall com.even.sg
 adb install -r out/patched-final.apk
@@ -72,6 +75,7 @@ release/
 │   ├── pull_apk.sh                    adb-pulls base+split APKs from the device
 │   ├── build_patched.sh               full one-shot pipeline
 │   ├── patch_libapp.py                the 4-byte NOP patch
+│   ├── patch_news_url.py              optional: swap the news feed base URL
 │   ├── inject_gadget.py               lief DT_NEEDED + frida-gadget bundle
 │   └── verify.sh                      sanity-check the output APK
 ├── frida/
@@ -81,6 +85,7 @@ release/
 └── docs/
     ├── pipeline.md                    end-to-end recipe with full commands
     ├── offsets.md                     exact addresses for v2.2.2 build 112
+    ├── news_api.md                    contract your news server must implement
     └── rederive.md                    how to rebuild offsets for a new version
 ```
 
@@ -106,7 +111,7 @@ See [`docs/rederive.md`](docs/rederive.md) for the play-by-play.
 
 - **Reply-and-dismiss.** Built-in commands kept the mic listening for a follow-up question. Our hijack loses that — every reply ends the conversation. The fix is to make the chat path also `transitionTo(StayState)`; details and exact addresses in [`FINDINGS.md`](FINDINGS.md).
 - **No opt-in for local intents.** If you genuinely want "brightness up" to set brightness today, you can't — it always reaches your agent. Proposed: prefix command with `"glasses ..."` to bypass the patch. Trivial to add to `final_fix.js`.
-- **News feed locked to Even.** The app pulls news from `api2.evenreal.co`. Some users will want their own feed. Approach: DNS redirect or `libapp.so` string patch.
+- **News feed redirect** (now optional, opt-in via env var). The app pulls news from `https://api2.evenreal.co` and appends `/v2/g/news_list`, `/v2/g/news_sources`, `/v2/g/news_categories`, `/v2/g/news_favorites_settings`, `/v2/g/news_favorites_settings_save`. Set `NEWS_URL=…` when running `build_patched.sh` to point those at your own server. The base URL **must be exactly 24 characters** so the Dart object pool isn't shifted (e.g. `https://news.example.com`).
 - **Version-locked.** Offsets above are for `com.even.sg v2.2.2 build 112`. Newer = redo step 5 of the [Quickstart](#quickstart-5-commands).
 
 ---
