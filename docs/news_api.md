@@ -8,6 +8,28 @@ No auth headers are added to these specific calls (the AI agent endpoint has its
 
 ---
 
+## Response envelope (REQUIRED for every endpoint)
+
+Every Even API response — news included — is wrapped in a common envelope, decoded by `even/common/api/models/ai/common_entity.dart` and logged by the `[API-Auth]` interceptor. **If you return the raw model body at the top level, the app's JSON parser finds nothing under `.data`, the UI shows "no news sources" / "something went wrong", and logcat shows `traceId=null`.**
+
+```json
+{
+  "code": 200,
+  "msg": "ok",
+  "data": { /* the model body documented in the per-endpoint sections below */ },
+  "traceId": "<a fresh uuid per request>"
+}
+```
+
+- `code` (int) — success status. `200` is what real Even responses send. The auth interceptor only logs/forwards; downstream model code reads `.data` regardless of `code` value, but match the real backend.
+- `msg` (string) — human-readable status. `"ok"` is fine.
+- `data` — the actual model body. The `"Response body:"` example under each endpoint below documents what goes here.
+- `traceId` (string) — anything that's a string; per-request UUID is conventional. The auth interceptor logs it as `traceId=<value>` so you can correlate logs with your server.
+
+The FastAPI stub at the bottom of this file shows the wrapping helper in context.
+
+---
+
 ## Conventions
 
 - **`String?`** → JSON string or `null`.
@@ -189,7 +211,7 @@ Request body: same `NewsSetting` shape as the response above. Treat as an upsert
 
 ```python
 # news_stub.py
-import httpx
+import httpx, uuid
 from fastapi import FastAPI, Request, Response
 
 app = FastAPI()
@@ -208,10 +230,16 @@ EMPTY_SETTING = {
     "selectOnlyLanguage": False, "timeRange": 24,
 }
 
+def wrap(data):
+    # Every Even response goes through the {code,msg,data,traceId} envelope.
+    # Without this, the auth interceptor logs traceId=null and the model
+    # parsers find nothing under .data → "no news sources" in the UI.
+    return {"code": 200, "msg": "ok", "data": data, "traceId": uuid.uuid4().hex}
+
 @app.post("/v2/g/news_list")
 async def news_list(body: dict):
     # body = {"languages": [...], "regions": [...], "categories": [...]}
-    return {
+    return wrap({
         "articles": [
             {
                 "source":      "my feed",
@@ -222,23 +250,23 @@ async def news_list(body: dict):
             }
         ],
         "total": 1,
-    }
+    })
 
 @app.get("/v2/g/news_sources")
 async def news_sources():
-    return {"sources": []}      # empty az-list is fine
+    return wrap({"sources": []})      # empty az-list is fine
 
 @app.get("/v2/g/news_categories")
 async def news_categories():
-    return {"categories": []}   # MUST be a list, not null
+    return wrap({"categories": []})   # `categories` MUST be a list, not null
 
 @app.get("/v2/g/news_favorites_settings")
 async def get_settings():
-    return EMPTY_SETTING
+    return wrap(EMPTY_SETTING)
 
 @app.post("/v2/g/news_favorites_settings_save")
 async def save_settings(body: dict):
-    return {"success": True}
+    return wrap({"success": True})
 
 
 # Catch-all reverse proxy — MUST be registered last so it doesn't shadow the
