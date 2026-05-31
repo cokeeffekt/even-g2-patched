@@ -183,13 +183,22 @@ Request body: same `NewsSetting` shape as the response above. Treat as an upsert
 
 ## Minimal server stub
 
-`pip install fastapi uvicorn[standard]`, then `uvicorn news_stub:app --port 4242 --ssl-keyfile … --ssl-certfile …`. Put it behind whatever reverse-proxy/TLS arrangement matches your patched URL.
+`pip install fastapi uvicorn[standard] httpx`, then `uvicorn news_stub:app --port 4242 --ssl-keyfile … --ssl-certfile …`. Put it behind whatever reverse-proxy/TLS arrangement matches your patched URL.
+
+> **You MUST include the catch-all reverse-proxy route at the bottom of the file.** The URL we patch in `libapp.so` is the shared base for the *entire* app's API (auth, user_info, jarvis, health, etc.), not just news. Without proxying the non-news paths back to `https://api2.evenreal.co`, the app can't even log in. See the [README's news-feed section](../README.md#optional-point-the-news-feed-at-your-own-server) for the full explanation and a copy-paste prompt for AI coding tools.
 
 ```python
 # news_stub.py
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, Request, Response
 
 app = FastAPI()
+
+UPSTREAM = "https://api2.evenreal.co"
+_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+_HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive",
+               "te", "trailers", "transfer-encoding", "upgrade",
+               "content-encoding"}
 
 EMPTY_SETTING = {
     "categories": [], "category": [],
@@ -230,6 +239,35 @@ async def get_settings():
 @app.post("/v2/g/news_favorites_settings_save")
 async def save_settings(body: dict):
     return {"success": True}
+
+
+# Catch-all reverse proxy — MUST be registered last so it doesn't shadow the
+# news routes above. Every path the app calls that isn't a news endpoint gets
+# transparently forwarded to the real Even Realities backend.
+@app.api_route("/{path:path}",
+               methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
+async def proxy(path: str, request: Request):
+    fwd_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in _HOP_BY_HOP and not k.lower().startswith("proxy-")}
+    try:
+        upstream = await _client.request(
+            request.method,
+            f"{UPSTREAM}/{path}",
+            params=request.url.query,
+            content=await request.body(),
+            headers=fwd_headers,
+        )
+    except httpx.TimeoutException:
+        return Response(content=b'{"error":"upstream timeout"}', status_code=504,
+                        media_type="application/json")
+    except httpx.RequestError:
+        return Response(content=b'{"error":"upstream unreachable"}', status_code=502,
+                        media_type="application/json")
+    resp_headers = {k: v for k, v in upstream.headers.items()
+                    if k.lower() not in _HOP_BY_HOP}
+    return Response(content=upstream.content,
+                    status_code=upstream.status_code,
+                    headers=resp_headers)
 ```
 
 ---

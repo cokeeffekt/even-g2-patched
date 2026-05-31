@@ -63,7 +63,23 @@ After launching the patched app once, every voice command goes to whatever endpo
 
 ### Optional: point the news feed at your own server
 
-The patch can also redirect the in-glasses news feed away from Even Realities' `api2.evenreal.co` to a server you control. Set `NEWS_URL` when running the build:
+You can redirect the in-glasses news feed to a server you control. **Read this whole section before building** — the short version is "you're hijacking more than just news, and your server has to act as a reverse proxy for everything else."
+
+#### What gets redirected (it's more than news)
+
+The 24-char string `https://api2.evenreal.co` baked into `libapp.so` at file offset `0x1cbf47` is the **shared base URL for the entire app's backend**, not just the news feed. Every endpoint the Dart `ApiService` class hits — auth, `/v2/g/user_info`, `/v2/g/get_privacy_urls`, `/v2/g/jarvis/conversate/*`, `/v2/g/health/*`, `/v2/evenhub/installed`, the news endpoints, and more — appends a path to this single base. There is no separate news-only base in the binary, so a one-string byte-swap can't isolate news.
+
+Consequence: if you point this string at your own server and don't proxy non-news paths, **the app won't even log in.** It'll try to call `/v2/g/user_info` against your mock, get nothing back, and stop.
+
+#### What your server has to do
+
+Implement the five news endpoints from [`docs/news_api.md`](docs/news_api.md), and for **every other path**, transparently reverse-proxy the request to `https://api2.evenreal.co` (forwarding method, query string, body, and headers — including `Authorization`/`Cookie` — and returning the upstream status/headers/body verbatim, minus hop-by-hop headers).
+
+Done right, the user experience is: your news server controls news, Even's backend handles everything else, and the app behaves normally.
+
+#### Building with `NEWS_URL`
+
+Once your server has both the news routes and the proxy fallback, set `NEWS_URL` when running the build:
 
 ```bash
 NEWS_URL='https://news.example.com' \
@@ -71,7 +87,7 @@ NEWS_URL='https://news.example.com' \
     ./scripts/build_patched.sh
 ```
 
-The base URL **must be exactly 24 characters** (same length as the original `https://api2.evenreal.co`) — `scripts/patch_news_url.py` does a strict same-length byte-swap into the Dart object pool. Anything else will be rejected with a clear error.
+The URL **must be exactly 24 characters** (same length as the original `https://api2.evenreal.co`) — `scripts/patch_news_url.py` does a strict same-length byte-swap into the Dart object pool. Anything else will be rejected with a clear error.
 
 `verify.sh` (auto-run as the last build step) confirms what landed in the final APK:
 
@@ -81,7 +97,31 @@ news base URL (post-lief shift, +0x1000 -> 0x1ccf47):
     swapped (custom feed)
 ```
 
-Your server must implement the five news endpoints the app calls — full request/response contract is in [`docs/news_api.md`](docs/news_api.md), including a minimal FastAPI stub you can copy-paste to get started.
+#### Fast-track prompt for AI coding tools
+
+If you already have the [news endpoints](docs/news_api.md) stubbed (the minimal FastAPI stub at the bottom of that doc is a good starting point) and just need to add the proxy fallback, paste this into Claude / your coding assistant of choice on your server, against your existing mock file:
+
+> I have a FastAPI mock that handles the five Even Realities G2 news endpoints (`POST /v2/g/news_list`, `GET /v2/g/news_sources`, `GET /v2/g/news_categories`, `GET /v2/g/news_favorites_settings`, `POST /v2/g/news_favorites_settings_save`). I need to add a **catch-all reverse proxy** so that any other path the Even app calls is transparently forwarded to the real upstream at `https://api2.evenreal.co`. Without this, the app can't reach auth/user_info/health/jarvis endpoints and won't even log in.
+>
+> Requirements:
+>
+> 1. **Catch-all comes last in route order** — all my existing news routes must match first. Implement it as `@app.api_route("/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])`.
+> 2. **Use `httpx.AsyncClient`** for the upstream call, with `httpx.Timeout(30.0, connect=10.0)`. Build the upstream URL as `f"https://api2.evenreal.co/{path}"` and forward the query string from `request.url.query`.
+> 3. **Forward the request body verbatim** with `await request.body()` — don't try to parse it.
+> 4. **Forward all incoming headers EXCEPT hop-by-hop / routing ones**: drop (case-insensitive) `host`, `content-length`, `connection`, `keep-alive`, `proxy-*`, `te`, `trailers`, `transfer-encoding`, `upgrade`. Keep `authorization`, `cookie`, `user-agent`, `content-type`, and any custom Even-app headers.
+> 5. **Return upstream's status, body, and headers verbatim**, dropping the same hop-by-hop set plus `content-encoding` and `transfer-encoding`. Plain `Response`, not `StreamingResponse` — these are tiny JSON payloads.
+> 6. **Log every proxied call** at INFO with method, path, upstream status, and a truncated body preview, matching the format my existing news routes use.
+> 7. **Verify upstream TLS** (`verify=True`, the default).
+> 8. **No retry, no caching** — clean transparent forwarding.
+>
+> Error handling:
+> - Upstream timeout → HTTP 504, body `{"error": "upstream timeout"}`.
+> - Upstream network error → HTTP 502, body `{"error": "upstream unreachable"}`.
+> - Never crash the worker on an upstream failure.
+>
+> Show me the new code and where it goes in the file relative to the existing news routes. Don't change the news endpoints.
+
+After your server is up with both the news routes and the proxy, run `adb logcat | grep API-Auth` while using the patched app — every call should show up there with paths to verify against your server logs.
 
 ### Confirming the patch is alive on the device
 
