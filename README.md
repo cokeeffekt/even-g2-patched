@@ -40,18 +40,17 @@ Assumes you have a Pixel 7a or similar on a recent Android with the matching app
 # 1. System deps
 sudo pacman -S --needed android-tools python-pipx llvm capstone     # or apt/dnf equivalent
 
-# 2. Python tools
+# 2. Python tools — both lief (ELF rewriting) and pyaxmlparser (manifest patching)
 pipx install frida-tools
-python -m venv .venv && .venv/bin/pip install lief
+pipx inject frida-tools lief pyaxmlparser      # add both libs to the same venv used below
 
 # 3. Pull your APK from the phone, then run the patcher
 ./scripts/pull_apk.sh             # pulls all split APKs from /data/app
-./scripts/build_patched.sh        # merges splits, applies the NOP, bundles frida-gadget+script,
+PYTHON=~/.local/share/pipx/venvs/frida-tools/bin/python \
+    ./scripts/build_patched.sh    # merges splits, flips extractNativeLibs=true,
+                                  # applies the NOP, bundles frida-gadget+script,
                                   # re-signs with uber-apk-signer
                                   # outputs ./out/patched-final.apk
-
-# Optional: also redirect the news feed to your own server (see "News feed redirect" below)
-NEWS_URL='https://news.example.com' ./scripts/build_patched.sh
 
 # 4. Install
 adb uninstall com.even.sg
@@ -61,6 +60,50 @@ adb install -r out/patched-final.apk
 You'll have to re-pair the glasses and re-sign in to the app (uninstall wipes user data). That's the one-time cost.
 
 After launching the patched app once, every voice command goes to whatever endpoint you've configured for the AI Agent in the app's settings, in OpenAI chat-completions format.
+
+### Optional: point the news feed at your own server
+
+The patch can also redirect the in-glasses news feed away from Even Realities' `api2.evenreal.co` to a server you control. Set `NEWS_URL` when running the build:
+
+```bash
+NEWS_URL='https://news.example.com' \
+    PYTHON=~/.local/share/pipx/venvs/frida-tools/bin/python \
+    ./scripts/build_patched.sh
+```
+
+The base URL **must be exactly 24 characters** (same length as the original `https://api2.evenreal.co`) — `scripts/patch_news_url.py` does a strict same-length byte-swap into the Dart object pool. Anything else will be rejected with a clear error.
+
+`verify.sh` (auto-run as the last build step) confirms what landed in the final APK:
+
+```
+news base URL (post-lief shift, +0x1000 -> 0x1ccf47):
+    'https://news.example.com'
+    swapped (custom feed)
+```
+
+Your server must implement the five news endpoints the app calls — full request/response contract is in [`docs/news_api.md`](docs/news_api.md), including a minimal FastAPI stub you can copy-paste to get started.
+
+### Confirming the patch is alive on the device
+
+Once installed, watch for the gadget script's startup banner in logcat:
+
+```bash
+adb logcat -s FRIDA_PATCH:V
+```
+
+You should see, at app launch:
+```
+FRIDA_PATCH: === script loaded ===
+FRIDA_PATCH: libapp base: 0x...
+FRIDA_PATCH: hooks installed: processResponse@... nop@... -> builtin@... diyAIChat@...
+```
+
+…then per voice command:
+```
+FRIDA_PATCH: procResp: CACHED cmp=0x... text="..."        (every ASR partial+final result)
+FRIDA_PATCH: diyAIChat: natural x1 already has our text   (chat-classified — natural code worked)
+FRIDA_PATCH: [#N] diyAIChat: SUBSTITUTED x1 ...           (built-in-hijacked — we fixed the text)
+```
 
 ---
 
@@ -76,6 +119,7 @@ release/
 │   ├── build_patched.sh               full one-shot pipeline
 │   ├── patch_libapp.py                the 4-byte NOP patch
 │   ├── patch_news_url.py              optional: swap the news feed base URL
+│   ├── set_extract_native_libs.py     manifest patch — forces .so extraction so the gadget can find its script
 │   ├── inject_gadget.py               lief DT_NEEDED + frida-gadget bundle
 │   └── verify.sh                      sanity-check the output APK
 ├── frida/
@@ -110,8 +154,7 @@ See [`docs/rederive.md`](docs/rederive.md) for the play-by-play.
 ## Known limitations / TODO
 
 - **Reply-and-dismiss.** Built-in commands kept the mic listening for a follow-up question. Our hijack loses that — every reply ends the conversation. The fix is to make the chat path also `transitionTo(StayState)`; details and exact addresses in [`FINDINGS.md`](FINDINGS.md).
-- **No opt-in for local intents.** If you genuinely want "brightness up" to set brightness today, you can't — it always reaches your agent. Proposed: prefix command with `"glasses ..."` to bypass the patch. Trivial to add to `final_fix.js`.
-- **News feed redirect** (now optional, opt-in via env var). The app pulls news from `https://api2.evenreal.co` and appends `/v2/g/news_list`, `/v2/g/news_sources`, `/v2/g/news_categories`, `/v2/g/news_favorites_settings`, `/v2/g/news_favorites_settings_save`. Set `NEWS_URL=…` when running `build_patched.sh` to point those at your own server. The base URL **must be exactly 24 characters** so the Dart object pool isn't shifted (e.g. `https://news.example.com`).
+- **Local intent opt-in via "glass ..." / "glasses ..." prefix.** Prefix any voice command with `glass` (or `glasses`) to route it back through the on-device built-in dispatch — useful for "glass brightness up", "glass quicklist on", etc. The Frida script strips the prefix from the ASR transcript so the classifier sees the unprefixed phrase, then redirects execution at the NOP site into `getTaskByIntent` → `handleAiCommand`. See `frida/README.md` for the mechanics. Caveat: if the on-device classifier doesn't recognise the stripped phrase as a known intent label (`disp_bright_inc`, `ql_on`, `conversate_on`, …), the dispatch silently no-ops.
 - **Version-locked.** Offsets above are for `com.even.sg v2.2.2 build 112`. Newer = redo step 5 of the [Quickstart](#quickstart-5-commands).
 
 ---

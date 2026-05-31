@@ -30,8 +30,9 @@ for f in APKEditor.jar uber-apk-signer.jar libfrida-gadget.so; do
     [ -f "$TOOLS/$f" ] || { echo "ERROR: missing $TOOLS/$f — see comment at top of this script" >&2; exit 1; }
 done
 
-echo "[*] 1/5  Merge split APKs"
+echo "[*] 1/5  Merge split APKs + flip extractNativeLibs=true on manifest"
 java -jar "$TOOLS/APKEditor.jar" m -i "$APKS" -o "$WORK/merged.apk" >/dev/null
+$PYTHON "$SCRIPTS_DIR/set_extract_native_libs.py" --apk "$WORK/merged.apk"
 
 echo "[*] 2/5  Extract libapp.so + apply 4-byte NOP (+ optional news URL swap)"
 mkdir -p "$WORK/lib"
