@@ -83,8 +83,23 @@ Currently the runtime text-refresh hook needs to be re-attached on every app lau
 ### 3. Re-derive when app updates
 All offsets are tied to libapp.so v2.2.2 build 112. New app versions shift everything.
 
-### 4. News feed redirect
-The app pulls a news feed from `api2.evenreal.co` (saw `/v2/g/*` patterns in logs). Want to replace with a self-hosted feed source. Approaches: (a) DNS redirect via the home network or a proxy, (b) binary-patch the URL string in libapp.so. The first is reversible; the second is durable but requires the new host to mimic the API contract.
+### 4. News feed redirect (implemented)
+The app pulls a news feed from `api2.evenreal.co`. Resolved via the 24-char in-place URL swap in `scripts/patch_news_url.py` plus a server-side mock that implements the five news endpoints AND a catch-all reverse proxy for everything else (the swapped string is the shared base for the entire app's API, not just news). Full verified contract — including the gotchas about envelope `code:0` not `code:200`, GET+POST on `news_favorites_settings`, article `uri` must be a short opaque ID not a URL, and server-side settings persistence — is in [`docs/news_api.md`](docs/news_api.md).
+
+### 4a. Shorten the news poll interval (open)
+The app polls `news_list` on a `Timer.periodic` measured in hours. Want to bring it to ~10-30 min so news on the glasses stays current. Two viable paths:
+
+**Path A — Frida-side `Timer.periodic` hijack (recommended).** Hook `Timer::Timer.periodic` at libapp `0x104ff70` Blutter offset (+0x1000 post-lief). At entry, detect when the caller is `NewsService._startNewsFetchTimer` (at `0x1558620`), and substitute the Duration argument with a shorter one. Same arg-mutation pattern as the existing `diyAIChat` x1 substitution in `frida/final_fix.js` (which is known to work without GC barrier issues). Need to investigate which arg register holds the Duration in the calling convention.
+
+**Path B — Const-pool Duration patch.** The hour count is resolved through Dart's GetX extension chain via a const-pool lookup at `[PP + 0x2a1e8]`. Find that entry's file offset in libapp.so and edit the microsecond field of the referenced Duration. Risky: that constant may be reused by other `.hours()` callers — verify with grep before editing.
+
+Useful addresses from the dive that ruled out a simple inline literal flip:
+- `GetNumUtils.hours` wrapper at `0x1558780`
+- Two `.hours()` call sites in `NewsService._startNewsFetchTimer`: `0x1558670` (initial fetch delay) and `0x1558804` (periodic interval)
+- `NewsService._startNewsFetchTimer` entry at `0x1558620`
+- `Timer::Timer.periodic` entry at `0x104ff70`
+
+Recommended start: Path A. The arg-substitution pattern is proven and reverts cleanly.
 
 ### 5. "glasses" keyword for opt-in local intent (implemented)
 `final_fix.js` now recognises a `glass ` or `glasses ` prefix on the ASR transcript. At `processResponse` the prefix is stripped from the `OneByteString` in place (chars shifted left, tail padded with spaces) so the on-device intent classifier sees the unprefixed phrase. A second hook at the NOP site (`0x1be04bc` + 0x1000) sets PC to `0x1be066c` + 0x1000 — the original `tbnz` branch target — to put execution back on the `getTaskByIntent` → `handleAiCommand` path. Note: the assumption is that the on-device classifier reads `AsrResult.text` *after* `processResponse` returns. If it actually classifies in parallel with ASR, the strip won't reclassify and `aiCommand.intent` will still be `"chat"`, so `handleTask illegal !!!` will log and the built-in dispatch will silently no-op. In that case, fall back to a local keyword → intent table inside the Frida script.
