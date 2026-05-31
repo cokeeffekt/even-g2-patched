@@ -14,15 +14,15 @@ Every Even API response — news included — is wrapped in a common envelope, d
 
 ```json
 {
-  "code": 200,
-  "msg": "ok",
+  "code": 0,
+  "msg": "Success",
   "data": { /* the model body documented in the per-endpoint sections below */ },
   "traceId": "<a fresh uuid per request>"
 }
 ```
 
-- `code` (int) — success status. `200` is what real Even responses send. The auth interceptor only logs/forwards; downstream model code reads `.data` regardless of `code` value, but match the real backend.
-- `msg` (string) — human-readable status. `"ok"` is fine.
+- `code` (int) — success status. **Real Even uses `0` for success**, *not* `200` as a previous version of this doc claimed. The earlier guess was based on HTTP conventions; live captures showed `0`. Pick anything you like since downstream model code reads `.data` regardless, but match the real backend for safety.
+- `msg` (string) — human-readable status. Real Even sends `"Success"` (capital S). `"ok"` works in practice but match real for safety.
 - `data` — the actual model body. The `"Response body:"` example under each endpoint below documents what goes here.
 - `traceId` (string) — anything that's a string; per-request UUID is conventional. The auth interceptor logs it as `traceId=<value>` so you can correlate logs with your server.
 
@@ -113,6 +113,35 @@ The FastAPI stub at the bottom of this file shows the wrapping helper in context
 | `timeRange`          | `num?`                | lookback window (hours) |
 
 > The app emits both `categories`+`category` and `defaultSource`+`source` in its toJson — looks like a backward-compat carryover. Returning both from the server is safest.
+
+---
+
+## Verified contract (live capture, 2026-05-31)
+
+Everything below in the per-endpoint sections was derived from `IsType_*_Stub` traces in the Blutter dump. The live capture session of 2026-05-31 (logging both directions through `/_capture/jsonl`) corrected several of those inferences. **Treat this section as authoritative when it conflicts with the legacy tables/examples below.**
+
+| topic | what live capture proved |
+|---|---|
+| envelope `code` | `0` (not `200`) |
+| envelope `msg` | `"Success"` (capital S) |
+| `news_favorites_settings` HTTP method | **Both GET *and* POST**. The app uses GET to fetch and POST in other flows. Register handlers on both. Without GET, GETs fall through to the catch-all proxy and the app shows the user's real Even account preferences. |
+| `news_categories` is called | Yes. The first capture session missed it because that screen wasn't navigated; a later session confirmed `GET /v2/g/news_categories`. |
+| `news_favorites_settings.category` | `List[str]` of category *names* (`["Business", "Politics", ...]`) — **not** a list of objects. |
+| `news_favorites_settings.categories` | `List[{name, type, noData}]` — this is the object list. `category` and `categories` are different shapes. |
+| `news_favorites_settings.source[]` | Full shape `{id: int, display_name: str, name: str, selected: bool, noData: bool}`. |
+| `news_favorites_settings.defaultSource[]` | **Minimal** `{id: int, name: str}` — only those two fields. |
+| `news_sources.sources[].sources[]` | Inner list elements are also **minimal** `{id: int, name: str}`. |
+| all `id` fields | **`int`**, not strings. |
+| `selectOnlyLanguage` field | **Does not exist** in real responses — Blutter showed a parser for it but the live envelope omits it. |
+| `language` (singular) and `region` | Always **empty lists** in successful responses (not null, not omitted). |
+| article `uri` | Short opaque identifier — real Even sends a 10-digit numeric string. **Must NOT be a URL.** The app reindexes by `uri` and longer values trigger `receiverApplyNewsEvent reindex failure`. A 16-char hex hash works (stable across requests is mandatory). |
+| article `source` | Must exactly match a `name` in the persisted `subscribed source[]` array. Articles with non-subscribed source names get filtered out client-side. |
+| article `dateTimePub` | UTC `Z` format (`"2026-05-31T07:48:40Z"`). Real Even uses recent timestamps; older articles may be filtered. |
+| settings persistence | Stored on Even's backend tied to the user account — **not** on-device. So your mock must persist saved settings server-side (e.g. JSON file in a Docker volume), otherwise user selections disappear on every fetch. |
+| catch-all reverse proxy | Required for the patch to be usable. The 24-char base URL we swap covers the **entire** app's API (auth, jarvis, health, evenhub, …), not just news. Without proxying non-news paths back to `https://api2.evenreal.co`, the app can't even log in. |
+| upstream rate-limiting | The proxied flow shows ~45% failure rate on non-news endpoints, with parse errors of `type 'String' is not a subtype of type 'Map<String, dynamic>'`. Diagnosis: `api2.evenreal.co` sometimes returns non-JSON (HTML / `404 page not found`) when an endpoint doesn't exist or rate-limits the proxy IP. Acceptable for personal use; would need caching/throttling for shared deployment. |
+
+A fast-track AI prompt that bundles all of this is in the top-level [README](../README.md#optional-point-the-news-feed-at-your-own-server) — the FastAPI stub at the bottom of this file is also kept current with the corrections above.
 
 ---
 
@@ -211,7 +240,7 @@ Request body: same `NewsSetting` shape as the response above. Treat as an upsert
 
 ```python
 # news_stub.py
-import httpx, uuid
+import httpx, json, uuid
 from fastapi import FastAPI, Request, Response
 
 app = FastAPI()
@@ -234,39 +263,125 @@ def wrap(data):
     # Every Even response goes through the {code,msg,data,traceId} envelope.
     # Without this, the auth interceptor logs traceId=null and the model
     # parsers find nothing under .data → "no news sources" in the UI.
-    return {"code": 200, "msg": "ok", "data": data, "traceId": uuid.uuid4().hex}
+    return {"code": 0, "msg": "Success", "data": data, "traceId": uuid.uuid4().hex}
+
+import hashlib
+from datetime import datetime, timezone
+
+def _utc_z():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _article_uri(source, title, dateTimePub):
+    # Stable per-article opaque ID. Must NOT be a URL — the app reindexes by
+    # uri and a long URL triggers `receiverApplyNewsEvent reindex failure`.
+    return hashlib.sha1(f"{source}|{title}|{dateTimePub}".encode()).hexdigest()[:16]
+
 
 @app.post("/v2/g/news_list")
 async def news_list(body: dict):
     # body = {"languages": [...], "regions": [...], "categories": [...]}
-    return wrap({
-        "articles": [
-            {
-                "source":      "my feed",
-                "title":       "Hello from your patched G2",
-                "uri":         "https://news.example.com",
-                "body":        "This is a custom news feed.",
-                "dateTimePub": "2026-05-29T00:00:00Z",
-            }
-        ],
-        "total": 1,
-    })
+    ts = _utc_z()
+    article = {
+        "source":      "G2 Briefs",      # MUST match a name in subscribed source[]
+        "title":       "Hello from your patched G2",
+        "body":        "Aim for 500-3000 chars here. Real Even articles are full body text "
+                       "— short bodies render as broken cards on the glasses.",
+        "dateTimePub": ts,
+    }
+    article["uri"] = _article_uri(article["source"], article["title"], article["dateTimePub"])
+    return wrap({"articles": [article], "total": 1})
+
 
 @app.get("/v2/g/news_sources")
 async def news_sources():
-    return wrap({"sources": []})      # empty az-list is fine
+    # Inner items are MINIMAL — just {id:int, name:str}.
+    return wrap({
+        "sources": [
+            {"letter": "G", "sources": [{"id": 1, "name": "G2 Briefs"}]},
+        ]
+    })
+
 
 @app.get("/v2/g/news_categories")
 async def news_categories():
-    return wrap({"categories": []})   # `categories` MUST be a list, not null
+    return wrap({"categories": [
+        {"name": "Business",   "type": "Business",   "noData": False},
+        {"name": "Technology", "type": "Technology", "noData": False},
+    ]})
 
+
+# News favorites settings — accept BOTH GET and POST. The app uses GET to fetch
+# and POSTs through other paths; missing GET = falls through to the proxy and
+# the user sees their real Even account preferences.
 @app.get("/v2/g/news_favorites_settings")
-async def get_settings():
-    return wrap(EMPTY_SETTING)
+@app.post("/v2/g/news_favorites_settings")
+async def news_favorites_settings_any():
+    return wrap(_load_settings())
+
 
 @app.post("/v2/g/news_favorites_settings_save")
-async def save_settings(body: dict):
-    return wrap({"success": True})
+async def save_settings(request: Request):
+    body = await request.json()
+    return wrap(_save_settings(body))
+
+
+# Persist user selections to disk so they survive container restarts. Without
+# this, every fetch returns _default_setting() and user-chosen sources disappear.
+import threading
+from pathlib import Path
+_SETTINGS_PATH = Path("/data/news_settings.json")
+_settings_lock = threading.Lock()
+
+def _default_setting():
+    # Verified shape, 2026-05-31 live capture.
+    return {
+        "language":  [],                # always empty list
+        "languages": [
+            {"id": 1, "display_name": "English", "name": "EN",
+             "selected": True, "noData": False},
+        ],
+        "region":         [],           # always empty list
+        "isAllCategory":  True,
+        "category": ["Business", "Technology"],   # List[str] of category NAMES
+        "source": [                     # FULL NewsSource shape
+            {"id": 1, "display_name": "G2 Briefs",
+             "name": "G2 Briefs", "selected": True, "noData": False},
+        ],
+        "recommended": False,
+        "defaultSource": [              # MINIMAL — just id + name
+            {"id": 1, "name": "G2 Briefs"},
+        ],
+        "categories": [                 # objects, NOT plain strings
+            {"name": "Business",   "type": "Business",   "noData": False},
+            {"name": "Technology", "type": "Technology", "noData": False},
+        ],
+        "timeRange": 2,
+        # NOTE: no `selectOnlyLanguage` field — real Even omits it
+    }
+
+def _load_settings_unlocked():
+    if _SETTINGS_PATH.exists():
+        try:
+            return json.loads(_SETTINGS_PATH.read_text())
+        except Exception:
+            pass
+    return _default_setting()
+
+def _load_settings():
+    with _settings_lock:
+        return _load_settings_unlocked()
+
+def _save_settings(payload: dict):
+    with _settings_lock:
+        current = _load_settings_unlocked()
+        if isinstance(payload, dict):
+            merged = {**current, **{k: v for k, v in payload.items()
+                                    if k in _default_setting()}}
+        else:
+            merged = current
+        _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SETTINGS_PATH.write_text(json.dumps(merged, indent=2))
+        return merged
 
 
 # Catch-all reverse proxy — MUST be registered last so it doesn't shadow the
