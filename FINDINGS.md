@@ -86,20 +86,25 @@ All offsets are tied to libapp.so v2.2.2 build 112. New app versions shift every
 ### 4. News feed redirect (implemented)
 The app pulls a news feed from `api2.evenreal.co`. Resolved via the 24-char in-place URL swap in `scripts/patch_news_url.py` plus a server-side mock that implements the five news endpoints AND a catch-all reverse proxy for everything else (the swapped string is the shared base for the entire app's API, not just news). Full verified contract — including the gotchas about envelope `code:0` not `code:200`, GET+POST on `news_favorites_settings`, article `uri` must be a short opaque ID not a URL, and server-side settings persistence — is in [`docs/news_api.md`](docs/news_api.md).
 
-### 4a. Shorten the news poll interval (open)
-The app polls `news_list` on a `Timer.periodic` measured in hours. Want to bring it to ~10-30 min so news on the glasses stays current. Two viable paths:
+### 4a. Shorten the news poll interval (implemented)
+The app polled `news_list` on a `Timer.periodic` measured in hours. Now Frida-stomped to 15 min via a fourth hook in `final_fix.js`.
 
-**Path A — Frida-side `Timer.periodic` hijack (recommended).** Hook `Timer::Timer.periodic` at libapp `0x104ff70` Blutter offset (+0x1000 post-lief). At entry, detect when the caller is `NewsService._startNewsFetchTimer` (at `0x1558620`), and substitute the Duration argument with a shorter one. Same arg-mutation pattern as the existing `diyAIChat` x1 substitution in `frida/final_fix.js` (which is known to work without GC barrier issues). Need to investigate which arg register holds the Duration in the calling convention.
+**Where the constant lives.** AOT specialised `3.hours` into a parameterless wrapper at libapp Blutter offset `0x1558780` that allocates a `Duration` (size 0x10, single unboxed-int64 field at tagged offset `+7`) and stores the constant `0x283baec00` (= 10800000000 us = 3h) into it. The wrapper is called from exactly five sites — all in `NewsService` (`_startNewsFetchTimer`'s start-delay, schedule-boundary calc, and periodic interval; plus `_isNeedFetchNews`'s gate and `_needForceFetch`'s `3.hours - 1.minutes` threshold). No other Dart code in the binary uses this specialisation, so a wrapper-level swap is safe.
 
-**Path B — Const-pool Duration patch.** The hour count is resolved through Dart's GetX extension chain via a const-pool lookup at `[PP + 0x2a1e8]`. Find that entry's file offset in libapp.so and edit the microsecond field of the referenced Duration. Risky: that constant may be reused by other `.hours()` callers — verify with grep before editing.
+**The hook.** `Interceptor.attach` with `onLeave` at `0x1558780 + 0x1000`. Read the returned tagged pointer, confirm `[ret+7]` reads 10800000000 (defensive — degrade to no-op if a future build changes the wrapper), then `writeS64` the desired interval. Because `Duration._duration` is an unboxed int64 (not a Dart object reference), there's no write barrier to bypass and nothing in the GC graph mutates. The Duration is also freshly-allocated per call, so the in-place stomp is per-call and can't alias another caller's Duration.
 
-Useful addresses from the dive that ruled out a simple inline literal flip:
-- `GetNumUtils.hours` wrapper at `0x1558780`
-- Two `.hours()` call sites in `NewsService._startNewsFetchTimer`: `0x1558670` (initial fetch delay) and `0x1558804` (periodic interval)
-- `NewsService._startNewsFetchTimer` entry at `0x1558620`
-- `Timer::Timer.periodic` entry at `0x104ff70`
+**Why a wrapper-level hook (not a call-site hook).** Stomping at the call site would have required identifying the right site (`0x1558828`'s BL to `Timer.periodic`, with the Duration in x2). But shortening only that site would desync the `_isNeedFetchNews` `elapsed >= 3.hours` gate and the `_needForceFetch` `3.hours - 1.minutes` threshold — they'd still expect a 3-hour cadence and skip ticks. The wrapper hook shrinks every dependent computation uniformly.
 
-Recommended start: Path A. The arg-substitution pattern is proven and reverts cleanly.
+**Interval choice.** 15 min default (`NEWS_POLL_INTERVAL_US` constant at top of `frida/final_fix.js`). The server-side mock's content cache TTL is 5 min, so going shorter just wastes calls.
+
+### 4b. Mock-side news contract gotchas (added 2026-06-02, after a day of live use)
+Two non-obvious mock requirements that we found only by running the patched build for a full day on hardware and watching the news widget intermittently blank itself. Both are documented in detail in [`docs/news_api.md`](docs/news_api.md); summarised here for the FINDINGS thread:
+
+- **`news_list` must return ≥ 5 articles per response.** `receiverApplyNewsEvent` calls a no-arg List method on the buffered news list and checks `result - 5 ≥ 0` (libapp `0x155428c`: `sub x0, x1, #5; tbnz x0, #0x3f, FAILURE`). Below 5, every periodic fetch ends with the app sending `APP_REQUEST_CLEAR_ALL_DATA(13)` to the glasses, blanking the news widget, then scheduling a 3-min retry that hits the same failure. The symptom is "news widget randomly goes empty every ~15 min and recovers on the next manual fetch". Pad with stable filler entries; the receiver only checks count, not relevance.
+
+- **Article `uri` must be derived from the article's *slot identity*, not its content.** `sha256(source).hexdigest()[:16]` works for singleton-per-source slots. `sha256(source + title)` does not — once the slot's title or body legitimately refreshes (Calendar ticking over, news rotation), the uri changes and the next reindex against the previously-cached uri fails. Same `APP_REQUEST_CLEAR_ALL_DATA(13)` blanking consequence. The earlier docs said "stable across requests is mandatory" but didn't warn against title-as-input; we hit this twice during the day.
+
+These weren't visible from static analysis alone; the receiver-side codepath only fires when the glasses send a news event back to the app, which the mock can't simulate. They surfaced once we had end-to-end logs (`adb logcat -s flutter:V`) tied to the timing of the empty-state symptom.
 
 ### 5. "glasses" keyword for opt-in local intent (implemented)
 `final_fix.js` now recognises a `glass ` or `glasses ` prefix on the ASR transcript. At `processResponse` the prefix is stripped from the `OneByteString` in place (chars shifted left, tail padded with spaces) so the on-device intent classifier sees the unprefixed phrase. A second hook at the NOP site (`0x1be04bc` + 0x1000) sets PC to `0x1be066c` + 0x1000 — the original `tbnz` branch target — to put execution back on the `getTaskByIntent` → `handleAiCommand` path. Note: the assumption is that the on-device classifier reads `AsrResult.text` *after* `processResponse` returns. If it actually classifies in parallel with ASR, the strip won't reclassify and `aiCommand.intent` will still be `"chat"`, so `handleTask illegal !!!` will log and the built-in dispatch will silently no-op. In that case, fall back to a local keyword → intent table inside the Frida script.

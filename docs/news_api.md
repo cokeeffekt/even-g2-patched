@@ -116,9 +116,9 @@ The FastAPI stub at the bottom of this file shows the wrapping helper in context
 
 ---
 
-## Verified contract (live capture, 2026-05-31)
+## Verified contract (live capture, 2026-05-31 / 2026-06-02)
 
-Everything below in the per-endpoint sections was derived from `IsType_*_Stub` traces in the Blutter dump. The live capture session of 2026-05-31 (logging both directions through `/_capture/jsonl`) corrected several of those inferences. **Treat this section as authoritative when it conflicts with the legacy tables/examples below.**
+Everything below in the per-endpoint sections was derived from `IsType_*_Stub` traces in the Blutter dump. Live capture sessions (logging both directions through `/_capture/jsonl`) corrected several of those inferences. **Treat this section as authoritative when it conflicts with the legacy tables/examples below.**
 
 | topic | what live capture proved |
 |---|---|
@@ -126,7 +126,7 @@ Everything below in the per-endpoint sections was derived from `IsType_*_Stub` t
 | envelope `msg` | `"Success"` (capital S) |
 | `news_favorites_settings` HTTP method | **Both GET *and* POST**. The app uses GET to fetch and POST in other flows. Register handlers on both. Without GET, GETs fall through to the catch-all proxy and the app shows the user's real Even account preferences. |
 | `news_categories` is called | Yes. The first capture session missed it because that screen wasn't navigated; a later session confirmed `GET /v2/g/news_categories`. |
-| `news_favorites_settings.category` | `List[str]` of category *names* (`["Business", "Politics", ...]`) — **not** a list of objects. |
+| `news_favorites_settings.category` | `List[str]` of category *names* (`["Business", "Politics", ...]`) — **not** a list of objects. The Blutter parser for `_$NewsSettingFromJson` reads this key with `TypeArguments: <String>` (libapp `0x1552ca0`). Returning objects here produces `type '_Map<String, dynamic>' is not a subtype of type 'String' in type cast` on the GET response. |
 | `news_favorites_settings.categories` | `List[{name, type, noData}]` — this is the object list. `category` and `categories` are different shapes. |
 | `news_favorites_settings.source[]` | Full shape `{id: int, display_name: str, name: str, selected: bool, noData: bool}`. |
 | `news_favorites_settings.defaultSource[]` | **Minimal** `{id: int, name: str}` — only those two fields. |
@@ -134,10 +134,12 @@ Everything below in the per-endpoint sections was derived from `IsType_*_Stub` t
 | all `id` fields | **`int`**, not strings. |
 | `selectOnlyLanguage` field | **Does not exist** in real responses — Blutter showed a parser for it but the live envelope omits it. |
 | `language` (singular) and `region` | Always **empty lists** in successful responses (not null, not omitted). |
-| article `uri` | Short opaque identifier — real Even sends a 10-digit numeric string. **Must NOT be a URL.** The app reindexes by `uri` and longer values trigger `receiverApplyNewsEvent reindex failure`. A 16-char hex hash works (stable across requests is mandatory). |
+| **article count: `news_list` MUST return ≥ 5 articles per response** | The receiver-side `receiverApplyNewsEvent` calls a no-arg `List` method on the buffered news list and checks `result - 5 ≥ 0` (libapp `0x155428c..0x1554294`: `sub x0, x1, #5; tbnz x0, #0x3f, FAILURE`). With fewer than 5 articles, every fetch triggers `receiverApplyNewsEvent reindex failure` followed by `APP_REQUEST_CLEAR_ALL_DATA(13)` over BLE — the app **actively wipes the glasses news widget** on every periodic fetch. A `_scheduleForceUpdateRetry` is then queued in 3 min and re-runs the same check, also failing. Workaround: pad your response with at least 5 articles. Stable filler entries are fine (yesterday's brief, day-before, etc.). |
+| article `uri` stability | Short opaque identifier; real Even sends a 10-digit numeric string. **Must NOT be a URL.** 16-char hex works in practice. **Stability requirement is strict and goes beyond "same uri across requests"**: the uri must be derived from the article's *slot identity*, NOT its content. `sha256(source).hexdigest()[:16]` works for singleton-per-source slots (Calendar summary, latest G2 Briefs, etc.). `sha256(source + title).hexdigest()[:16]` **does not** — when a slot's title/body refreshes (Calendar shows new events; news feed rotates), the uri changes and the app reindexes against the previous uri it had cached, failing. Title/body/dateTimePub may legitimately change between fetches; the uri must not. |
 | article `source` | Must exactly match a `name` in the persisted `subscribed source[]` array. Articles with non-subscribed source names get filtered out client-side. |
 | article `dateTimePub` | UTC `Z` format (`"2026-05-31T07:48:40Z"`). Real Even uses recent timestamps; older articles may be filtered. |
 | settings persistence | Stored on Even's backend tied to the user account — **not** on-device. So your mock must persist saved settings server-side (e.g. JSON file in a Docker volume), otherwise user selections disappear on every fetch. |
+| subscription source-of-truth (open) | The app's "subscribed sources" count appears to be driven by an **on-device cache** that does not refresh from server `selected:true` flags after a manual server-side mutation. Setting `source[i].selected=false` on the server out-of-band did not change the count the app displayed, even after the app's next `GET /v2/g/news_favorites_settings`. Safe approach for mocks: keep all three of `source[]` (`selected:true` for every entry the user "has"), `defaultSource[]` (same entries, minimal shape), and the `news_sources` catalog **fully consistent and complete** for whatever sources the user expects. Diverging the three risks ambiguous UI state. |
 | catch-all reverse proxy | Required for the patch to be usable. The 24-char base URL we swap covers the **entire** app's API (auth, jarvis, health, evenhub, …), not just news. Without proxying non-news paths back to `https://api2.evenreal.co`, the app can't even log in. |
 | upstream rate-limiting | The proxied flow shows ~45% failure rate on non-news endpoints, with parse errors of `type 'String' is not a subtype of type 'Map<String, dynamic>'`. Diagnosis: `api2.evenreal.co` sometimes returns non-JSON (HTML / `404 page not found`) when an endpoint doesn't exist or rate-limits the proxy IP. Acceptable for personal use; would need caching/throttling for shared deployment. |
 
@@ -158,14 +160,14 @@ Request body (sent by `DashboardHttpHelper.getNewsList`, all three are `List<Str
 }
 ```
 
-Response body: `NewsListResModel`. Example:
+Response body: `NewsListResModel`. Example (note: `uri` is a short opaque slot identifier — `sha256(source).hexdigest()[:16]` is a reliable form for singleton-per-source slots — and the response **must** contain at least 5 articles; see the Verified contract table above):
 ```json
 {
   "articles": [
     {
       "source": "Hacker News",
       "title": "Story headline",
-      "uri": "https://example.com/story",
+      "uri": "5a6c2e1d7f3b8a9c",
       "body": "Lead paragraph...",
       "dateTimePub": "2026-05-29T14:00:00Z"
     }
@@ -271,25 +273,49 @@ from datetime import datetime, timezone
 def _utc_z():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _article_uri(source, title, dateTimePub):
-    # Stable per-article opaque ID. Must NOT be a URL — the app reindexes by
-    # uri and a long URL triggers `receiverApplyNewsEvent reindex failure`.
-    return hashlib.sha1(f"{source}|{title}|{dateTimePub}".encode()).hexdigest()[:16]
+def _slot_uri(slot_key):
+    # Stable per-slot opaque ID. Must NOT be a URL (reindex fails on long values),
+    # and must be derived from a stable per-slot identity — NOT from title or body.
+    # If you hash title in, then every time the slot's content refreshes (Calendar
+    # ticks over to "0 events today, 2 events this week", etc.), the uri changes
+    # and `receiverApplyNewsEvent reindex failure` fires on the next periodic fetch,
+    # which causes the app to send APP_REQUEST_CLEAR_ALL_DATA(13) to the glasses
+    # and blank the news widget. Use a stable per-slot key (source name alone for
+    # singleton-per-source slots; source + slot index for paginated slots).
+    return hashlib.sha256(slot_key.encode()).hexdigest()[:16]
+
+
+# Aim for at least 5 articles per response. The receiver-side `receiverApplyNewsEvent`
+# checks `count - 5 >= 0` on the buffered news list (libapp 0x155428c) and fires
+# `APP_REQUEST_CLEAR_ALL_DATA(13)` to the glasses when the check fails. If your real
+# content yields fewer than 5 slots, pad with stable filler (yesterday's brief,
+# day-before, …) — each with its own stable uri.
+_SLOTS = [
+    ("G2 Briefs",   "g2-briefs:latest"),
+    ("G2 Briefs",   "g2-briefs:yesterday"),
+    ("G2 Briefs",   "g2-briefs:day-before"),
+    ("Calendar",    "calendar:today"),
+    ("Calendar",    "calendar:tomorrow"),
+]
 
 
 @app.post("/v2/g/news_list")
 async def news_list(body: dict):
     # body = {"languages": [...], "regions": [...], "categories": [...]}
+    # Real per-slot content goes here. The (source, slot_key) pair must stay
+    # constant across requests — only title/body/dateTimePub may change.
     ts = _utc_z()
-    article = {
-        "source":      "G2 Briefs",      # MUST match a name in subscribed source[]
-        "title":       "Hello from your patched G2",
-        "body":        "Aim for 500-3000 chars here. Real Even articles are full body text "
-                       "— short bodies render as broken cards on the glasses.",
-        "dateTimePub": ts,
-    }
-    article["uri"] = _article_uri(article["source"], article["title"], article["dateTimePub"])
-    return wrap({"articles": [article], "total": 1})
+    articles = []
+    for source, slot_key in _SLOTS:
+        articles.append({
+            "source":      source,           # MUST match a name in subscribed source[]
+            "title":       "Headline for this slot",
+            "body":        "Aim for 500-3000 chars here. Real Even articles are full body text "
+                           "— short bodies render as broken cards on the glasses.",
+            "dateTimePub": ts,
+            "uri":         _slot_uri(slot_key),
+        })
+    return wrap({"articles": articles, "total": len(articles)})
 
 
 @app.get("/v2/g/news_sources")

@@ -1,4 +1,4 @@
-// Three-hook setup:
+// Four-hook setup:
 //   1) processResponse — read the ASR transcript at x2.field_7. If it parses as
 //      a _OneByteString (Dart cid 94), cache its compressed pointer. If the text
 //      begins with "glass " or "glasses ", strip that prefix in place and arm the
@@ -13,6 +13,14 @@
 //      (ql_on, disp_bright_inc, …) that the NOP hijacks into the chat path: in
 //      those cases the natural code didn't update content, so x1 inherits whatever
 //      the prior chat query left there.
+//   4) GetNumUtils.hours (3-hour specialisation) — stomp the freshly-allocated
+//      Duration's microseconds field on return. This wrapper is the AOT-specialised
+//      `3.hours` and is called from five places, all in NewsService (start timer,
+//      initial-delay calc, periodic interval, _isNeedFetchNews gate, _needForceFetch
+//      gate). Shortening the return uniformly drops the news poll cadence from 3h
+//      to NEWS_POLL_INTERVAL_US (default 15 min) without breaking the internal
+//      timing arithmetic. Duration._duration is an unboxed int64 — no write
+//      barrier, no GC graph touched.
 //
 // Why substitute x1 instead of writing into DiyAgentTask.content directly: the
 // earlier write-content design bypassed Dart's WriteBarrierWrappersStub. Within
@@ -29,6 +37,14 @@ const PROC_RESPONSE_OFF = 0x1e13938 + 0x1000;
 const NOP_OFF           = 0x1be04bc + 0x1000;  // the NOP'd tbnz site (still used for glass-prefix PC redirect)
 const BUILTIN_OFF       = 0x1be066c + 0x1000;  // original tbnz branch target (built-in dispatch path)
 const DIY_AI_CHAT_OFF   = 0x1be42b4 + 0x1000;  // ApiServiceThirdPartyChatExt.diyAIChat — text in x1
+const NEWS_HOURS_OFF    = 0x1558780 + 0x1000;  // GetNumUtils.hours AOT-specialised wrapper that returns Duration(3h)
+
+// News-poll interval override. The wrapper at NEWS_HOURS_OFF normally returns
+// 10800000000us (3h); we replace that value on every call. 15 min is a balance
+// between freshness and battery; backend mock content cache TTL is 5 min so going
+// shorter than that just wastes calls.
+const NEWS_POLL_INTERVAL_US = 15 * 60 * 1000 * 1000;  // 15 minutes
+const NEWS_HOURS_ORIGINAL_US = "10800000000";          // 3 hours, as a decimal string for int64() — sanity check before stomping
 
 const THR_FIELD_TABLE_VALUES_OFF = 0x68;
 const DIY_INSTANCE_FIELD_OFF     = 0x2c68;
@@ -221,9 +237,45 @@ function classIdAt(taggedPtr) {
     try { const t = taggedPtr.add(-1).readU32(); return (t >>> 12) & 0xfffff; } catch (e) { return -1; }
 }
 
+// 4. GetNumUtils.hours (3-hour specialisation). onLeave runs at the wrapper's `ret`;
+// retval is the tagged pointer to the freshly-allocated Duration. The microseconds
+// field (Duration._duration in this build, unboxed int64) sits at tagged offset +7
+// — that's the same offset both the wrapper's `stur x1, [x0, #7]` and every reader
+// site uses. We sanity-check the value matches the expected 3h constant before
+// stomping, so if a future build changes the wrapper or shares it across other
+// `.hours` callers we degrade to a no-op instead of corrupting them.
+const NEWS_POLL_INTERVAL_INT64 = int64(String(NEWS_POLL_INTERVAL_US));
+const NEWS_HOURS_ORIGINAL_INT64 = int64(NEWS_HOURS_ORIGINAL_US);
+let newsHoursStompCount = 0;
+let newsHoursSkipCount = 0;
+
+Interceptor.attach(libapp.add(NEWS_HOURS_OFF), {
+    onLeave(retval) {
+        try {
+            if (retval.isNull()) return;
+            const microsAddr = retval.add(0x7);
+            const current = microsAddr.readS64();
+            if (!current.equals(NEWS_HOURS_ORIGINAL_INT64)) {
+                newsHoursSkipCount++;
+                if (newsHoursSkipCount <= 3) {
+                    marker(`news.hours: SKIP unexpected micros=${current} (expected ${NEWS_HOURS_ORIGINAL_INT64}) @ ${retval}`);
+                }
+                return;
+            }
+            microsAddr.writeS64(NEWS_POLL_INTERVAL_INT64);
+            newsHoursStompCount++;
+            if (newsHoursStompCount <= 5 || newsHoursStompCount % 20 === 0) {
+                marker(`[#${newsHoursStompCount}] news.hours: 3h -> ${NEWS_POLL_INTERVAL_US / 60e6}min @ ${retval}`);
+            }
+        } catch (e) {
+            marker(`!! news.hours hook: ${e.message}`);
+        }
+    }
+});
+
 // NOTE: enter hook intentionally removed. Investigation showed even a no-op hook
 // installed at CmdDispatchState.enter's function entry was associated with crashes
 // (Dart Handle check). We need a different hook point — see below.
 
-console.log(`[+] Hooks: processResponse @ ${libapp.add(PROC_RESPONSE_OFF)}, nop @ ${libapp.add(NOP_OFF)} -> ${libapp.add(BUILTIN_OFF)}, diyAIChat @ ${libapp.add(DIY_AI_CHAT_OFF)}`);
-marker(`hooks installed: processResponse@${libapp.add(PROC_RESPONSE_OFF)} nop@${libapp.add(NOP_OFF)} -> builtin@${libapp.add(BUILTIN_OFF)} diyAIChat@${libapp.add(DIY_AI_CHAT_OFF)}`);
+console.log(`[+] Hooks: processResponse @ ${libapp.add(PROC_RESPONSE_OFF)}, nop @ ${libapp.add(NOP_OFF)} -> ${libapp.add(BUILTIN_OFF)}, diyAIChat @ ${libapp.add(DIY_AI_CHAT_OFF)}, news.hours @ ${libapp.add(NEWS_HOURS_OFF)} (3h -> ${NEWS_POLL_INTERVAL_US / 60e6}min)`);
+marker(`hooks installed: processResponse@${libapp.add(PROC_RESPONSE_OFF)} nop@${libapp.add(NOP_OFF)} -> builtin@${libapp.add(BUILTIN_OFF)} diyAIChat@${libapp.add(DIY_AI_CHAT_OFF)} news.hours@${libapp.add(NEWS_HOURS_OFF)} (3h->${NEWS_POLL_INTERVAL_US / 60e6}min)`);
